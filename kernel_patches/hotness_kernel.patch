@@ -1,0 +1,272 @@
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 41c54051347a..ac5fdf1e6a3f 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -600,6 +600,20 @@ config MARVELL_CN10K_DPI
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called mrvl_cn10k_dpi.
+ 
++config ACCESSFREQ_PROVIDER
++   tristate "Access Frequency Provider"
++   depends on BPF
++   help
++     Provide a BPF-based interface for tracking page access
++
++config ACCESSFREQ_COUNT_QUERY
++   tristate "Access Frequency Count Query"
++   depends on ACCESSFREQ_PROVIDER
++
++config ACCESSFREQ_TOPK_QUERY
++   tristate "Access Frequency Top-K Query"
++   depends on ACCESSFREQ_PROVIDER
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/include/linux/mmap_demo.h b/include/linux/mmap_demo.h
+new file mode 100644
+index 000000000000..8431157444df
+--- /dev/null
++++ b/include/linux/mmap_demo.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_MMAP_DEMO_H
++#define _LINUX_MMAP_DEMO_H
++
++#include <linux/types.h>
++#include <linux/stddef.h>
++
++/*
++ * mmap_demo: hot/cold 결정용 공유 버퍼를 커널에서 참조하기 위한 공개 시그니처.
++ *
++ * get_buf:  버퍼의 base 포인터와 전체 길이(바이트)를 반환.
++ *           - 길이 >= 2 * sizeof(u64) 이어야 하며,
++ *           - arr[0]은 시퀀스(짝수=정상, 홀수=업데이트 중),
++ *           - arr[1..]에 키(vpn 등)를 저장하는 프로토콜을 가정.
++ *
++ * arr_len: 엔트리 개수(K_TOP)를 반환(선택적).
++ */
++
++const u64 *mmap_demo_get_buf(size_t *len_bytes);
++int        mmap_demo_arr_len(void);
++
++#endif /* _LINUX_MMAP_DEMO_H */
++
+diff --git a/mm/Makefile b/mm/Makefile
+index d2915f8c9dc0..7ac44e928977 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -3,6 +3,8 @@
+ # Makefile for the linux memory manager.
+ #
+ 
++obj-y += accessfreq_core.o
++
+ KASAN_SANITIZE_slab_common.o := n
+ KASAN_SANITIZE_slub.o := n
+ KASAN_SANITIZE_kmemleak.o := n
+diff --git a/mm/accessfreq_core.c b/mm/accessfreq_core.c
+new file mode 100644
+index 000000000000..a65baaa13d82
+--- /dev/null
++++ b/mm/accessfreq_core.c
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/accessfreq.h>
++
++/* provider 없을 때 기본 동작 */
++__weak u64 accessfreq_count_stub(struct mm_struct *mm, unsigned long addr) { return 0; }
++__weak bool accessfreq_topk_stub(struct mm_struct *mm, unsigned long addr) { return false; }
++
++/* static_call 키 정의 + 기본 타겟 연결 */
++DEFINE_STATIC_CALL(accessfreq_count_query, accessfreq_count_stub);
++DEFINE_STATIC_CALL(accessfreq_topk_query,  accessfreq_topk_stub);
++
++/* 모듈이 static_call_update()로 갱신할 수 있게 export */
++EXPORT_STATIC_CALL(accessfreq_count_query);
++EXPORT_STATIC_CALL(accessfreq_topk_query);
++
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index cdd1d8655a76..fb41d6216d3f 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -21,12 +21,26 @@
+ #include <linux/swapops.h>
+ #include <linux/shmem_fs.h>
+ #include <linux/ksm.h>
++#include <linux/atomic.h>
++#include <linux/nodemask.h>
++#include <linux/printk.h>
+ 
+ #include <asm/tlb.h>
+ #include <asm/pgalloc.h>
+ #include "internal.h"
+ #include "mm_slot.h"
+ 
++#include <linux/module.h>
++#include <linux/topology.h>
++#include <linux/mmap_demo.h>
++
++#define BIN_SHIFT 21
++
++#define HOT_NODE 0
++#define COLD_NODE 1
++
++extern const u64 *mmap_demo_get_buf(size_t *len_bytes);
++
+ enum scan_result {
+ 	SCAN_FAIL,
+ 	SCAN_SUCCEED,
+@@ -1059,12 +1073,123 @@ static int __collapse_huge_page_swapin(struct mm_struct *mm,
+ 	return result;
+ }
+ 
++/* 모듈이 로드되어 있으면 hot 여부를 판정해서 true 반환.
++ * 모듈이 없거나 읽기 실패면 false(=hot 판단 자체를 하지 않음). */
++static bool try_is_hot_addr(unsigned long address, bool *is_hot)
++{
++#if IS_ENABLED(CONFIG_MODULES)
++    const u64 *(*get_buf)(size_t *len_bytes);
++    int (*get_arr_len)(void);              /* K_TOP 조회용 (선택) */
++    const u64 *arr;
++    size_t len_bytes;
++    u64 seq1, seq2, vpn;
++    size_t n64, nkeys, i;
++
++    /* 모듈 심볼을 런타임 획득 (refcount++) */
++    get_buf = symbol_get(mmap_demo_get_buf);
++    get_arr_len = symbol_get(mmap_demo_arr_len);  /* 없으면 NULL */
++    if (!get_buf)
++        return false; /* 모듈 미로드 → hot 판정 스킵 */
++
++    arr = get_buf(&len_bytes);
++    if (!arr || len_bytes < 2 * sizeof(u64)) {
++        symbol_put(mmap_demo_get_buf);
++        if (get_arr_len) symbol_put(mmap_demo_arr_len);
++        return false;
++    }
++
++    vpn = ((u64)address) >> BIN_SHIFT;
++
++retry:
++    /* 1) 갱신 중(홀수) 감지 시 즉시 재시도: 불필요한 스캔 방지 */
++    seq1 = smp_load_acquire(&arr[0]);      /* 유저측 RELEASE-store와 페어 */
++    if (unlikely(seq1 & 1)) {
++        cpu_relax();
++        goto retry;
++    }
++
++    /* 2) nkeys 계산 + K_TOP으로 상한 (페이지 얼라인 패딩 스캔 방지) */
++    n64   = len_bytes / sizeof(u64);
++    nkeys = (n64 > 0) ? (n64 - 1) : 0;
++    if (get_arr_len) {
++        size_t ktop = get_arr_len();       /* 커널 모듈이 export한 K_TOP */
++        if (nkeys > ktop) nkeys = ktop;
++    }
++
++    /* 3) 선형 멤버십 검사 */
++    for (i = 0; i < nkeys; i++) {
++        if (READ_ONCE(arr[1 + i]) == vpn) {
++            /* 4) 일관성 재확인 (갱신 충돌 시 재시도) */
++            seq2 = smp_load_acquire(&arr[0]);
++            if (likely(!(seq2 & 1) && seq1 == seq2)) {
++                *is_hot = true;
++                symbol_put(mmap_demo_get_buf);
++                if (get_arr_len) symbol_put(mmap_demo_arr_len);
++                return true;               /* hot 판정 성공 */
++            }
++            goto retry;
++        }
++    }
++
++    /* 5) 집합에 없을 때도 일관성 확인 */
++    seq2 = smp_load_acquire(&arr[0]);
++    if (unlikely((seq2 & 1) || seq1 != seq2))
++        goto retry;
++
++    *is_hot = false;                        /* cold 판정 성공 */
++    symbol_put(mmap_demo_get_buf);
++    if (get_arr_len) symbol_put(mmap_demo_arr_len);
++    return true;
++#else
++    return false;
++#endif
++}
++
++static int pick_node_for_address(unsigned long address, struct collapse_control *cc)
++{
++    bool hot = false;
++    int preferred;
++
++    /* 1) 허용집합을 {0,2}로 항상 구성 (존재/메모리 노드만 켬) */
++    nodes_clear(cc->alloc_nmask);
++    if (HOT_NODE  >= 0 && HOT_NODE  < MAX_NUMNODES && node_state(HOT_NODE,  N_MEMORY))
++        node_set(HOT_NODE,  cc->alloc_nmask);
++    if (COLD_NODE >= 0 && COLD_NODE < MAX_NUMNODES && node_state(COLD_NODE, N_MEMORY))
++        node_set(COLD_NODE, cc->alloc_nmask);
++
++    /* 두 노드 중 실제로 쓸 수 있는 게 하나도 없으면 기존 로직 */
++    if (!node_state(HOT_NODE, N_MEMORY) && !node_state(COLD_NODE, N_MEMORY)) {
++        printk(KERN_INFO "No usage node\n");  
++	return hpage_collapse_find_target_node(cc);
++    }
++	
++    /* 2) 모듈(힌트) 없으면: cand=HOT_NODE(0)로 고정해 바로 리턴 */
++    if (!try_is_hot_addr(address, &hot)) {
++	printk(KERN_INFO "No hint\n");
++        return node_state(HOT_NODE, N_MEMORY) ? HOT_NODE :
++               node_state(COLD_NODE, N_MEMORY) ? COLD_NODE :
++               hpage_collapse_find_target_node(cc);
++    }
++
++    /* 3) 모듈이 켜져 있어 핫/콜드 판정이 되면 선호 노드 선택 */
++    preferred = hot ? (node_state(HOT_NODE,  N_MEMORY) ? HOT_NODE  :
++                       (node_state(COLD_NODE, N_MEMORY) ? COLD_NODE : -1))
++                    : (node_state(COLD_NODE, N_MEMORY) ? COLD_NODE :
++                       (node_state(HOT_NODE,  N_MEMORY) ? HOT_NODE  : -1));
++
++    if (preferred < 0)
++        return hpage_collapse_find_target_node(cc);
++
++    return preferred;  /* cand 우선, 부족하면 alloc_nmask {0,2} 안에서 폴백 */
++}
++
+ static int alloc_charge_folio(struct folio **foliop, struct mm_struct *mm,
+-			      struct collapse_control *cc)
++			      struct collapse_control *cc, unsigned long address)
+ {
+ 	gfp_t gfp = (cc->is_khugepaged ? alloc_hugepage_khugepaged_gfpmask() :
+ 		     GFP_TRANSHUGE);
+-	int node = hpage_collapse_find_target_node(cc);
++	//int node = hpage_collapse_find_target_node(cc); 원래 코드 부분
++	int node = pick_node_for_address(address, cc);
+ 	struct folio *folio;
+ 
+ 	folio = __folio_alloc(gfp, HPAGE_PMD_ORDER, node, &cc->alloc_nmask);
+@@ -1111,7 +1236,7 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
+ 	 */
+ 	mmap_read_unlock(mm);
+ 
+-	result = alloc_charge_folio(&folio, mm, cc);
++	result = alloc_charge_folio(&folio, mm, cc, address);
+ 	if (result != SCAN_SUCCEED)
+ 		goto out_nolock;
+ 
+@@ -1413,6 +1538,8 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
+ 	} else {
+ 		result = SCAN_SUCCEED;
+ 	}
++
++
+ out_unmap:
+ 	pte_unmap_unlock(pte, ptl);
+ 	if (result == SCAN_SUCCEED) {
+@@ -1815,7 +1942,7 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
+ 	VM_BUG_ON(!IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS) && !is_shmem);
+ 	VM_BUG_ON(start & (HPAGE_PMD_NR - 1));
+ 
+-	result = alloc_charge_folio(&new_folio, mm, cc);
++	result = alloc_charge_folio(&new_folio, mm, cc, addr);
+ 	if (result != SCAN_SUCCEED)
+ 		goto out;
+ 
